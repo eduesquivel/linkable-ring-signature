@@ -1,6 +1,9 @@
 import random
 from hashlib import sha256
 
+# ... (All helper functions _is_natural_power, _extended_euclid, 
+#      is_probably_prime, and the ZpStar class are UNCHANGED) ...
+
 def _is_natural_power(n):
     # Para cada posible exponente, hacemos búsqueda binaria de la base
     search_exponent = 2
@@ -120,7 +123,8 @@ class ZpStar:
 
 
 class RingSetup:
-    def __init__(self, generator, subgroup_order, n_participants, group):
+    # MODIFIED: Added h_generator
+    def __init__(self, generator, h_generator, subgroup_order, n_participants, group):
         # Is the order of the generator correct? For this we check that
         # 1. The subgroup order is prime
         # 2. The generator to the power of subgroup_order is the identity
@@ -132,10 +136,23 @@ class RingSetup:
             raise Exception("The generator is the identity, it's a trap!")
         if generator ** subgroup_order != group.get_identity():
             raise Exception("This is not the real order, it's a trap!")
-    
+            
+        # MODIFIED: Check the new generator h
+        if h_generator == group.get_identity():
+            raise Exception("The h_generator is the identity, it's a trap!")
+        if h_generator ** subgroup_order != group.get_identity():
+            raise Exception("This is not the real order for h, it's a trap!")
+        if h_generator == generator:
+            raise Exception("g and h cannot be the same generator!")
+            
+        self.generator = generator
+        self.h_generator = h_generator
+        self.subgroup_order = subgroup_order
+
         # Generate a group of participants
         self.participants = [
-            Signer(generator, subgroup_order) for _ in range(n_participants)
+            # MODIFIED: Pass h_generator to the Signer
+            Signer(generator, h_generator, subgroup_order) for _ in range(n_participants)
         ]
 
         # Store their public keys
@@ -146,67 +163,144 @@ class RingSetup:
 
     def get_random_participant(self):
         return random.choice(self.participants)
+        
+    # MODIFIED: Helper function to get the other participant
+    def get_other_participant(self, signer):
+        for p in self.participants:
+            if p != signer:
+                return p
+        return signer
 
 
 class Signer():
-    def __init__(self, generator, subgroup_order):
+    # MODIFIED: Added h_generator
+    def __init__(self, generator, h_generator, subgroup_order):
         self.generator = generator
+        self.h_generator = h_generator # MODIFIED: Store h
         self.subgroup_order = subgroup_order
         
         # Create and store a secret/public key pair
         self.secret_key = random.randint(1, subgroup_order - 1)
         self.public_key = generator ** self.secret_key
+        
+        # MODIFIED: Create the Key Image (Tag)
+        self.key_image = self.h_generator ** self.secret_key
 
     def get_public_key(self):
         return self.public_key
+        
+    # MODIFIED: Add a getter for the key image
+    def get_key_image(self):
+        return self.key_image
 
+    # MODIFIED: This function is heavily changed
     # Compute a ring signature for a message and a list of public keys
     def generate_ring_signature(self, message, public_keys):
         # Simplify notation
         q = self.subgroup_order
         g = self.generator
+        h = self.h_generator # MODIFIED: Get h
+        I = self.key_image  # MODIFIED: Get Key Image
         n = len(public_keys)
-
-        my_r = random.randint(1, q - 1)
-        print(f"my r {my_r}")
+        x_i = self.secret_key
         my_index = public_keys.index(self.public_key)
 
-        signatures = [0] * len(public_keys)
-        challenges = [0] * len(public_keys)
-        challenges[(my_index + 1) % n] = int.from_bytes(sha256((str(g ** my_r) + message).encode()).digest()) % q
+        # MODIFIED: Hash the message with the public key ring
+        # This prevents an attacker from swapping public keys
+        m_prime = "".join([str(pk) for pk in public_keys]) + message
 
+        # Store s and c values
+        signatures = [0] * n
+        challenges = [0] * n
+
+        # === Signer's "secret" step ===
+        # 1. Generate a random nonce
+        my_r = random.randint(1, q - 1)
+
+        # 2. Compute the "commitment" values for the signer's position
+        R_i = g ** my_r
+        R_prime_i = h ** my_r
+        
+        # 3. Compute the *next* challenge in the ring, c_{i+1}
+        c_next = int.from_bytes(
+            sha256((str(R_i) + str(R_prime_i) + m_prime).encode()).digest()
+        ) % q
+        challenges[(my_index + 1) % n] = c_next
+
+        # === Faking the rest of the ring ===
+        # 4. Iterate for all other participants
         for i in range(1, n):
             index = (my_index + i) % n
-            signatures[index] = random.randint(1, q - 1)
-            R = g ** signatures[index] * public_keys[index] ** (q - challenges[(index)])
-            challenges[(index + 1) % n] = int.from_bytes(sha256((str(R) + message).encode()).digest()) % q
+            
+            # 5. Pick a random s_j (the "fake" signature part)
+            s_j = random.randint(1, q - 1)
+            signatures[index] = s_j
+            c_j = challenges[index]
+            y_j = public_keys[index]
 
-        signatures[my_index] = (my_r + challenges[my_index] * self.secret_key) % q
-        print(f"s_{my_index}: {signatures[my_index]}")
+            # 6. Compute R_j and R'_j using the ring equations
+            # R = g^s * y^(-c)  ==> g^s * y^(q-c)
+            # R' = h^s * I^(-c) ==> h^s * I^(q-c)
+            R_j = (g ** s_j) * (y_j ** (q - c_j))
+            R_prime_j = (h ** s_j) * (I ** (q - c_j))
+            
+            # 7. Compute the *next* challenge c_{j+1}
+            c_next = int.from_bytes(
+                sha256((str(R_j) + str(R_prime_j) + m_prime).encode()).digest()
+            ) % q
+            challenges[(index + 1) % n] = c_next
 
-        random_index = random.randint(0, n - 1)
+        # === Closing the loop ===
+        # 8. Get the signer's challenge, c_i
+        c_i = challenges[my_index]
+        
+        # 9. Solve for the signer's signature part, s_i
+        # s_i = r + c_i * x_i  (mod q)
+        signatures[my_index] = (my_r + c_i * x_i) % q
 
-        return signatures, challenges[random_index], random_index
+        # MODIFIED: The signature is (KeyImage, c1, [s1, s2, ..., sn])
+        # We return c[0] (which is c_1 in 1-based indexing)
+        return I, challenges[0], signatures
 
 class Verifier:
-    def __init__(self, generator, subgroup_order):
+    # MODIFIED: Added h_generator
+    def __init__(self, generator, h_generator, subgroup_order):
         self.generator = generator
+        self.h_generator = h_generator # MODIFIED: Store h
         self.subgroup_order = subgroup_order
 
-    def verify_ring_signature(self, public_keys, message, signatures, challenge, challenge_index):
+    # MODIFIED: This function is heavily changed
+    def verify_ring_signature(self, public_keys, message, key_image, c1, signatures):
         # Verify a ring signature
         # simplify notation
         q = self.subgroup_order
         g = self.generator
+        h = self.h_generator # MODIFIED: Get h
+        I = key_image       # MODIFIED: Get I
         n = len(public_keys)
-        current_challenge = challenge
-
-        for i in range(1, n + 1):
-            index = (challenge_index + i) % n
-            prev = (index - 1) % n
-            R = g ** signatures[prev] * public_keys[prev] ** (q - current_challenge) 
-            current_challenge = int.from_bytes(sha256((str(R) + message).encode()).digest()) % q
-
-
-        return challenge == current_challenge
-
+        
+        # MODIFIED: Hash the message with the public key ring
+        m_prime = "".join([str(pk) for pk in public_keys]) + message
+        
+        # MODIFIED: We will re-compute the entire ring of challenges
+        current_challenge = c1
+        
+        for i in range(n):
+            s_i = signatures[i]
+            y_i = public_keys[i]
+            c_i = current_challenge
+            
+            # 1. Re-compute R_i and R'_i for this participant
+            # R = g^s * y^(-c)  ==> g^s * y^(q-c)
+            # R' = h^s * I^(-c) ==> h^s * I^(q-c)
+            R_i = (g ** s_i) * (y_i ** (q - c_i))
+            R_prime_i = (h ** s_i) * (I ** (q - c_i))
+            
+            # 2. Compute the *next* challenge
+            current_challenge = int.from_bytes(
+                sha256((str(R_i) + str(R_prime_i) + m_prime).encode()).digest()
+            ) % q
+            
+        # 3. After n iterations, 'current_challenge' is the re-computed c1.
+        # We check if it matches the c1 we started with.
+        return c1 == current_challenge
